@@ -24,6 +24,7 @@ import {
     scan,
     switchMap,
     take,
+    merge,
 } from "rxjs";
 import { fromFetch } from "rxjs/fetch";
 
@@ -40,8 +41,10 @@ const Birb = {
 } as const;
 
 const Constants = {
+    GRAVITY: 2000,
+    FLAP_VELOCITY: -520,
     PIPE_WIDTH: 50,
-    TICK_RATE_MS: 500, // Might need to change this!
+    TICK_RATE_MS: 16,
 } as const;
 
 // User input
@@ -52,10 +55,18 @@ type Key = "Space";
 
 type State = Readonly<{
     gameEnd: boolean;
+
+    // Bird velocity and position
+    birdY: number;
+    birdVy: number;
 }>;
 
 const initialState: State = {
     gameEnd: false,
+
+    // middle of screen, not falling start
+    birdY: Viewport.CANVAS_HEIGHT / 2 - Birb.HEIGHT / 2,
+    birdVy: 0,
 };
 
 /**
@@ -124,59 +135,52 @@ const render = (): ((s: State) => void) => {
     const scoreText = document.querySelector("#scoreText") as HTMLElement;
 
     const svg = document.querySelector("#svgCanvas") as SVGSVGElement;
-
     svg.setAttribute(
         "viewBox",
         `0 0 ${Viewport.CANVAS_WIDTH} ${Viewport.CANVAS_HEIGHT}`,
     );
-    /**
-     * Renders the current state to the canvas.
-     *
-     * In MVC terms, this updates the View using the Model.
-     *
-     * @param s Current state
-     */
+
+    // Create the bird once
+    const birdImg = createSvgElement(svg.namespaceURI, "image", {
+        id: "bird",
+        href: "assets/birb.png",
+        x: String(Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2),
+        y: String(initialState.birdY),
+        width: String(Birb.WIDTH),
+        height: String(Birb.HEIGHT),
+    }) as SVGImageElement;
+    svg.appendChild(birdImg);
+
+    // placeholder pipes
+    const pipeGapY = 200;
+    const pipeGapHeight = 100;
+
+    // Top pipe
+    const pipeTop = createSvgElement(svg.namespaceURI, "rect", {
+        x: "150",
+        y: "0",
+        width: String(Constants.PIPE_WIDTH),
+        height: String(pipeGapY - pipeGapHeight / 2),
+        fill: "green",
+    });
+    const pipeBottom = createSvgElement(svg.namespaceURI, "rect", {
+        x: "150",
+        y: String(pipeGapY + pipeGapHeight / 2),
+        width: String(Constants.PIPE_WIDTH),
+        height: String(Viewport.CANVAS_HEIGHT - (pipeGapY + pipeGapHeight / 2)),
+        fill: "green",
+    });
+    svg.appendChild(pipeTop);
+    svg.appendChild(pipeBottom);
+
     return (s: State) => {
-        // Add birb to the main grid canvas
-        const birdImg = createSvgElement(svg.namespaceURI, "image", {
-            href: "assets/birb.png",
-            x: `${Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2}`,
-            y: `${Viewport.CANVAS_HEIGHT / 2 - Birb.HEIGHT / 2}`,
-            width: `${Birb.WIDTH}`,
-            height: `${Birb.HEIGHT}`,
-        });
-        svg.appendChild(birdImg);
-
-        // Draw a static pipe as a demonstration
-        const pipeGapY = 200; // vertical center of the gap
-        const pipeGapHeight = 100;
-
-        // Top pipe
-        const pipeTop = createSvgElement(svg.namespaceURI, "rect", {
-            x: "150",
-            y: "0",
-            width: `${Constants.PIPE_WIDTH}`,
-            height: `${pipeGapY - pipeGapHeight / 2}`,
-            fill: "green",
-        });
-
-        // Bottom pipe
-        const pipeBottom = createSvgElement(svg.namespaceURI, "rect", {
-            x: "150",
-            y: `${pipeGapY + pipeGapHeight / 2}`,
-            width: `${Constants.PIPE_WIDTH}`,
-            height: `${Viewport.CANVAS_HEIGHT - (pipeGapY + pipeGapHeight / 2)}`,
-            fill: "green",
-        });
-
-        svg.appendChild(pipeTop);
-        svg.appendChild(pipeBottom);
+        birdImg.setAttribute("y", String(s.birdY));
+        // later stuff to be added here
     };
 };
 
 export const state$ = (csvContents: string): Observable<State> => {
     /** User input */
-
     const key$ = fromEvent<KeyboardEvent>(document, "keypress");
     const fromKey = (keyCode: Key) =>
         key$.pipe(filter(({ code }) => code === keyCode));
@@ -184,7 +188,50 @@ export const state$ = (csvContents: string): Observable<State> => {
     /** Determines the rate of time steps */
     const tick$ = interval(Constants.TICK_RATE_MS);
 
-    return tick$.pipe(scan((s: State) => ({ gameEnd: false }), initialState));
+    const dt$ = tick$.pipe(map(() => Constants.TICK_RATE_MS / 1000));
+
+    const pointerDown$ = merge(
+        fromEvent<MouseEvent>(document, "mousedown"),
+        fromEvent<TouchEvent>(document, "touchstart"),
+    );
+
+    // bird flap (aka birb goes up)
+    const flap$ = pointerDown$.pipe(
+        map(
+            () =>
+                (s: State): State => ({
+                    ...s,
+                    birdVy: Constants.FLAP_VELOCITY,
+                }),
+        ),
+    );
+
+    // gravity physics
+    const TOP = 0;
+    const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT;
+
+    const physics$ = dt$.pipe(
+        map(dt => (s: State): State => {
+            let vy = s.birdVy + Constants.GRAVITY * dt;
+            let y = s.birdY + vy * dt;
+
+            if (y >= GROUND) {
+                y = GROUND;
+                vy = 0;
+            }
+            if (y <= TOP) {
+                y = TOP;
+                vy = 0;
+            }
+
+            return { ...s, birdY: y, birdVy: vy };
+        }),
+    );
+
+    // final state$
+    return merge(physics$, flap$).pipe(
+        scan((s, reduce) => reduce(s), initialState),
+    );
 };
 
 // The following simply runs your main function on window load.  Make sure to leave it in place.
