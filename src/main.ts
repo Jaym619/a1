@@ -17,7 +17,7 @@ import "./style.css";
 import {
     Observable,
     catchError,
-    filter,
+    withLatestFrom,
     fromEvent,
     interval,
     map,
@@ -70,6 +70,9 @@ type State = Readonly<{
 
     elapsed: number;
     remainingDefs: ReadonlyArray<PipeDef>;
+
+    scoredIds: ReadonlyArray<number>;
+    hurtCooldown: number;
 }>;
 
 const initialState: State = {
@@ -85,6 +88,18 @@ const initialState: State = {
 
     elapsed: 0,
     remainingDefs: [],
+
+    scoredIds: [],
+    hurtCooldown: 0,
+};
+
+// helper function for generating stream
+const randStep = (seed: number) => {
+    const a = 1664525,
+        c = 1013904223,
+        m = 2 ** 32;
+    const next = (a * seed + c) >>> 0;
+    return { nextSeed: next, value: next / m };
 };
 
 /**
@@ -180,6 +195,17 @@ const render = (): ((s: State) => void) => {
         // move bird
         birdImg.setAttribute("y", String(s.birdY));
 
+        // updates lives and score
+        if (livesText) livesText.textContent = `Lives: ${s.lives}`;
+        if (scoreText) scoreText.textContent = `Score: ${s.score}`;
+
+        // when player runs out of lives game over displays
+        if (gameOver)
+            gameOver.setAttribute(
+                "visibility",
+                s.gameEnd ? "visible" : "hidden",
+            );
+
         // draw pipes from csv
         pipesG.innerHTML = "";
 
@@ -246,6 +272,11 @@ export const state$ = (csvContents: string): Observable<State> => {
         map(() => Constants.TICK_RATE_MS / 1000),
     );
 
+    const random$ = dt$.pipe(
+        scan(seed => randStep(seed).nextSeed, 0xc0ffee),
+        map(seed => randStep(seed).value),
+    );
+
     // csv pipe definitions
     const parsePipes = (csv: string): ReadonlyArray<PipeDef> => {
         const lines = csv
@@ -282,9 +313,12 @@ export const state$ = (csvContents: string): Observable<State> => {
 
     const pipeDefs = parsePipes(csvContents);
 
-    const PIPE_SPEED = 150;
+    // currently difficult to make it through pipes
+    // may need to change pipe speed value later
+    const PIPE_SPEED = 200;
     const TOP = 0;
     const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT;
+    const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
 
     // small pure partition helper
     const partition = <T>(
@@ -299,8 +333,11 @@ export const state$ = (csvContents: string): Observable<State> => {
 
     // tick reducer
     const tick$ = dt$.pipe(
-        map(dt => (s: State): State => {
+        withLatestFrom(random$),
+        map(([dt, r]) => (s: State): State => {
+            // advance time and cooldown
             const elapsed = s.elapsed + dt;
+            const hurtCooldown = Math.max(0, s.hurtCooldown - dt);
 
             // spawn any definitions whose time has arrived
             const [due, future] = partition(
@@ -335,6 +372,94 @@ export const state$ = (csvContents: string): Observable<State> => {
                 birdVy = 0;
             }
 
+            // all collisions (ground, top of display, pipes)
+
+            const bumpDown = 150 + r * 200;
+            const bumpUp = 250 + r * 170;
+
+            let lives = s.lives;
+            let hit = false;
+
+            // screen edge hits
+            if (birdY <= TOP) {
+                hit = true;
+                birdVy = bumpDown;
+            }
+            if (birdY >= GROUND) {
+                hit = true;
+                birdVy = -bumpUp;
+                birdY = GROUND;
+            }
+
+            // pipe hits
+            const overlaps = (
+                a: { x: number; y: number; w: number; h: number },
+                b: { x: number; y: number; w: number; h: number },
+            ) =>
+                a.x < b.x + b.w &&
+                a.x + a.w > b.x &&
+                a.y < b.y + b.h &&
+                a.y + a.h > b.y;
+
+            const birdBox = {
+                x: birdX,
+                y: birdY,
+                w: Birb.WIDTH,
+                h: Birb.HEIGHT,
+            };
+            for (const p of pipes) {
+                const half = p.gapH / 2;
+                const topH = Math.max(0, p.gapY - half);
+                const botY = Math.min(Viewport.CANVAS_HEIGHT, p.gapY + half);
+                const topRect = {
+                    x: p.x,
+                    y: 0,
+                    w: Constants.PIPE_WIDTH,
+                    h: topH,
+                };
+                const botRect = {
+                    x: p.x,
+                    y: botY,
+                    w: Constants.PIPE_WIDTH,
+                    h: Viewport.CANVAS_HEIGHT - botY,
+                };
+
+                if (overlaps(birdBox, topRect)) {
+                    hit = true;
+                    birdVy = bumpDown;
+                    break;
+                }
+                if (overlaps(birdBox, botRect)) {
+                    hit = true;
+                    birdVy = -bumpUp;
+                    break;
+                }
+            }
+
+            // apply damage once per cooldown window
+            if (hit && hurtCooldown <= 0 && !s.gameEnd) {
+                lives = Math.max(0, lives - 1);
+            }
+
+            const gameEnd = lives <= 0;
+
+            // scoring when passing a pipe
+            // bird passes when its right edge has gone beyond pipes right edge
+            const birdRight = birdX + Birb.WIDTH;
+            const newlyPassed = pipes
+                .filter(
+                    p =>
+                        p.x + Constants.PIPE_WIDTH < birdRight &&
+                        !s.scoredIds.includes(p.id),
+                )
+                .map(p => p.id);
+
+            const score = s.score + newlyPassed.length;
+            const scoredIds = newlyPassed.length
+                ? s.scoredIds.concat(newlyPassed)
+                : s.scoredIds;
+
+            // final next state
             return {
                 ...s,
                 elapsed,
@@ -342,6 +467,12 @@ export const state$ = (csvContents: string): Observable<State> => {
                 pipes,
                 birdY,
                 birdVy,
+                lives,
+                score,
+                scoredIds,
+                hurtCooldown:
+                    hit && hurtCooldown <= 0 && !gameEnd ? 0.6 : hurtCooldown, // 600ms invuln
+                gameEnd,
             };
         }),
     );
