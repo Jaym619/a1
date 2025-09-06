@@ -53,12 +53,23 @@ type Key = "Space";
 
 // State processing
 
+type Pipe = Readonly<{ id: number; x: number; gapY: number; gapH: number }>;
+type PipeDef = Readonly<{ time: number; gapYpx: number; gapHpx: number }>;
+
 type State = Readonly<{
     gameEnd: boolean;
 
     // Bird velocity and position
     birdY: number;
     birdVy: number;
+
+    // pipes + game stats
+    pipes: ReadonlyArray<Pipe>;
+    score: number;
+    lives: number;
+
+    elapsed: number;
+    remainingDefs: ReadonlyArray<PipeDef>;
 }>;
 
 const initialState: State = {
@@ -67,6 +78,13 @@ const initialState: State = {
     // middle of screen, not falling start
     birdY: Viewport.CANVAS_HEIGHT / 2 - Birb.HEIGHT / 2,
     birdVy: 0,
+
+    pipes: [],
+    score: 0,
+    lives: 3,
+
+    elapsed: 0,
+    remainingDefs: [],
 };
 
 /**
@@ -151,45 +169,62 @@ const render = (): ((s: State) => void) => {
     }) as SVGImageElement;
     svg.appendChild(birdImg);
 
-    // placeholder pipes
-    const pipeGapY = 200;
-    const pipeGapHeight = 100;
+    // create pipes group once
+    const pipesG = createSvgElement(svg.namespaceURI, "g", {
+        id: "pipes",
+    }) as SVGGElement;
+    svg.appendChild(pipesG);
 
-    // Top pipe
-    const pipeTop = createSvgElement(svg.namespaceURI, "rect", {
-        x: "150",
-        y: "0",
-        width: String(Constants.PIPE_WIDTH),
-        height: String(pipeGapY - pipeGapHeight / 2),
-        fill: "green",
-    });
-    const pipeBottom = createSvgElement(svg.namespaceURI, "rect", {
-        x: "150",
-        y: String(pipeGapY + pipeGapHeight / 2),
-        width: String(Constants.PIPE_WIDTH),
-        height: String(Viewport.CANVAS_HEIGHT - (pipeGapY + pipeGapHeight / 2)),
-        fill: "green",
-    });
-    svg.appendChild(pipeTop);
-    svg.appendChild(pipeBottom);
-
+    // frame updater
     return (s: State) => {
+        // move bird
         birdImg.setAttribute("y", String(s.birdY));
-        // later stuff to be added here
+
+        // draw pipes from csv
+        pipesG.innerHTML = "";
+
+        for (const p of s.pipes) {
+            const half = p.gapH / 2;
+            const topY = Math.max(
+                0,
+                Math.min(Viewport.CANVAS_HEIGHT, p.gapY - half),
+            );
+            const botY = Math.max(
+                0,
+                Math.min(Viewport.CANVAS_HEIGHT, p.gapY + half),
+            );
+
+            const topH = Math.max(0, topY);
+            const bottomH = Math.max(0, Viewport.CANVAS_HEIGHT - botY);
+
+            const top = createSvgElement(svg.namespaceURI, "rect", {
+                x: String(p.x),
+                y: "0",
+                width: String(Constants.PIPE_WIDTH),
+                height: String(topH),
+                fill: "green",
+                stroke: "black",
+                "stroke-width": "1",
+            });
+
+            const bottom = createSvgElement(svg.namespaceURI, "rect", {
+                x: String(p.x),
+                y: String(botY),
+                width: String(Constants.PIPE_WIDTH),
+                height: String(bottomH),
+                fill: "green",
+                stroke: "black",
+                "stroke-width": "1",
+            });
+
+            pipesG.appendChild(top);
+            pipesG.appendChild(bottom);
+        }
     };
 };
 
 export const state$ = (csvContents: string): Observable<State> => {
-    /** User input */
-    const key$ = fromEvent<KeyboardEvent>(document, "keypress");
-    const fromKey = (keyCode: Key) =>
-        key$.pipe(filter(({ code }) => code === keyCode));
-
-    /** Determines the rate of time steps */
-    const tick$ = interval(Constants.TICK_RATE_MS);
-
-    const dt$ = tick$.pipe(map(() => Constants.TICK_RATE_MS / 1000));
-
+    // mouse click input
     const pointerDown$ = merge(
         fromEvent<MouseEvent>(document, "mousedown"),
         fromEvent<TouchEvent>(document, "touchstart"),
@@ -206,31 +241,121 @@ export const state$ = (csvContents: string): Observable<State> => {
         ),
     );
 
-    // gravity physics
+    // time
+    const dt$ = interval(Constants.TICK_RATE_MS).pipe(
+        map(() => Constants.TICK_RATE_MS / 1000),
+    );
+
+    // csv pipe definitions
+    const parsePipes = (csv: string): ReadonlyArray<PipeDef> => {
+        const lines = csv
+            .split(/\r?\n/)
+            .map(l => l.trim())
+            .filter(Boolean);
+        const body = /^gap_y\s*,\s*gap_height\s*,\s*time/i.test(lines[0])
+            ? lines.slice(1)
+            : lines;
+
+        return body
+            .map(line => {
+                const [gy, gh, t] = line.split(",");
+                const gapYpx = Math.max(
+                    0,
+                    Math.min(
+                        Viewport.CANVAS_HEIGHT,
+                        Number(gy) * Viewport.CANVAS_HEIGHT,
+                    ),
+                );
+                const gapHpx = Math.max(
+                    10,
+                    Math.min(
+                        Viewport.CANVAS_HEIGHT,
+                        Number(gh) * Viewport.CANVAS_HEIGHT,
+                    ),
+                );
+                const time = Number(t);
+                return { time, gapYpx, gapHpx };
+            })
+            .filter(d => Number.isFinite(d.time))
+            .sort((a, b) => a.time - b.time);
+    };
+
+    const pipeDefs = parsePipes(csvContents);
+
+    const PIPE_SPEED = 150;
     const TOP = 0;
     const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT;
 
-    const physics$ = dt$.pipe(
+    // small pure partition helper
+    const partition = <T>(
+        xs: ReadonlyArray<T>,
+        pred: (x: T) => boolean,
+    ): [ReadonlyArray<T>, ReadonlyArray<T>] => {
+        const a: T[] = [],
+            b: T[] = [];
+        xs.forEach(x => (pred(x) ? a : b).push(x));
+        return [a, b];
+    };
+
+    // tick reducer
+    const tick$ = dt$.pipe(
         map(dt => (s: State): State => {
-            let vy = s.birdVy + Constants.GRAVITY * dt;
-            let y = s.birdY + vy * dt;
+            const elapsed = s.elapsed + dt;
 
-            if (y >= GROUND) {
-                y = GROUND;
-                vy = 0;
+            // spawn any definitions whose time has arrived
+            const [due, future] = partition(
+                s.remainingDefs,
+                d => d.time <= elapsed,
+            );
+            const spawned: ReadonlyArray<Pipe> = due.map((d, i) => ({
+                id: s.pipes.length + i + 1,
+
+                // pipes appear at right edge
+                x: Viewport.CANVAS_WIDTH,
+
+                gapY: d.gapYpx,
+                gapH: d.gapHpx,
+            }));
+
+            // move existing + spawned pipes left get culled off screen
+            const pipes = s.pipes
+                .concat(spawned)
+                .map(p => ({ ...p, x: p.x - PIPE_SPEED * dt }))
+                .filter(p => p.x + Constants.PIPE_WIDTH >= 0);
+
+            // gravity physics
+            let birdVy = s.birdVy + Constants.GRAVITY * dt;
+            let birdY = s.birdY + birdVy * dt;
+            if (birdY >= GROUND) {
+                birdY = GROUND;
+                birdVy = 0;
             }
-            if (y <= TOP) {
-                y = TOP;
-                vy = 0;
+            if (birdY <= TOP) {
+                birdY = TOP;
+                birdVy = 0;
             }
 
-            return { ...s, birdY: y, birdVy: vy };
+            return {
+                ...s,
+                elapsed,
+                remainingDefs: future,
+                pipes,
+                birdY,
+                birdVy,
+            };
         }),
     );
 
+    // seeds initial state
+    const seededInitial: State = {
+        ...initialState,
+        elapsed: 0,
+        remainingDefs: pipeDefs,
+    };
+
     // final state$
-    return merge(physics$, flap$).pipe(
-        scan((s, reduce) => reduce(s), initialState),
+    return merge(tick$, flap$).pipe(
+        scan((s, reduce) => reduce(s), seededInitial),
     );
 };
 
