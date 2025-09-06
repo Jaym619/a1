@@ -73,6 +73,7 @@ type State = Readonly<{
 
     scoredIds: ReadonlyArray<number>;
     hurtCooldown: number;
+    flapCooldown: number;
 }>;
 
 const initialState: State = {
@@ -91,6 +92,7 @@ const initialState: State = {
 
     scoredIds: [],
     hurtCooldown: 0,
+    flapCooldown: 0,
 };
 
 // helper function for generating stream
@@ -173,6 +175,18 @@ const render = (): ((s: State) => void) => {
         `0 0 ${Viewport.CANVAS_WIDTH} ${Viewport.CANVAS_HEIGHT}`,
     );
 
+    // sets background
+    const bg = createSvgElement(svg.namespaceURI, "image", {
+        id: "bg",
+        href: "assets/bg-flappy.webp",
+        x: "0",
+        y: "0",
+        width: String(Viewport.CANVAS_WIDTH),
+        height: String(Viewport.CANVAS_HEIGHT),
+        preserveAspectRatio: "none",
+    });
+    svg.appendChild(bg);
+
     // Create the bird once
     const birdImg = createSvgElement(svg.namespaceURI, "image", {
         id: "bird",
@@ -250,20 +264,21 @@ const render = (): ((s: State) => void) => {
 };
 
 export const state$ = (csvContents: string): Observable<State> => {
-    // mouse click input
-    const pointerDown$ = merge(
+    // flap (ignore when over)
+    const flap$ = merge(
         fromEvent<MouseEvent>(document, "mousedown"),
         fromEvent<TouchEvent>(document, "touchstart"),
-    );
-
-    // bird flap (aka birb goes up)
-    const flap$ = pointerDown$.pipe(
+    ).pipe(
         map(
             () =>
-                (s: State): State => ({
-                    ...s,
-                    birdVy: Constants.FLAP_VELOCITY,
-                }),
+                (s: State): State =>
+                    s.gameEnd || s.flapCooldown > 0
+                        ? s
+                        : {
+                              ...s,
+                              birdVy: Constants.FLAP_VELOCITY,
+                              flapCooldown: 0.12,
+                          },
         ),
     );
 
@@ -317,7 +332,7 @@ export const state$ = (csvContents: string): Observable<State> => {
     // may need to change pipe speed value later
     const PIPE_SPEED = 200;
     const TOP = 0;
-    const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT;
+    const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT - 65;
     const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
 
     // small pure partition helper
@@ -335,9 +350,24 @@ export const state$ = (csvContents: string): Observable<State> => {
     const tick$ = dt$.pipe(
         withLatestFrom(random$),
         map(([dt, r]) => (s: State): State => {
+            if (s.gameEnd) {
+                const vy = s.birdVy + Constants.GRAVITY * dt;
+                // player can fall through ground (accurate to real flappy bird btw)
+                const y = s.birdY + vy * dt;
+                return {
+                    ...s,
+                    birdVy: vy,
+                    birdY: y,
+
+                    // player can't flap
+                    flapCooldown: 0,
+                };
+            }
+
             // advance time and cooldown
             const elapsed = s.elapsed + dt;
             const hurtCooldown = Math.max(0, s.hurtCooldown - dt);
+            const flapCooldown = Math.max(0, s.flapCooldown - dt);
 
             // spawn any definitions whose time has arrived
             const [due, future] = partition(
@@ -443,6 +473,10 @@ export const state$ = (csvContents: string): Observable<State> => {
 
             const gameEnd = lives <= 0;
 
+            if (s.gameEnd) {
+                return { ...s, flapCooldown: 0 };
+            }
+
             // scoring when passing a pipe
             // bird passes when its right edge has gone beyond pipes right edge
             const birdRight = birdX + Birb.WIDTH;
@@ -463,6 +497,7 @@ export const state$ = (csvContents: string): Observable<State> => {
             return {
                 ...s,
                 elapsed,
+                flapCooldown,
                 remainingDefs: future,
                 pipes,
                 birdY,
