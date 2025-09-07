@@ -27,6 +27,9 @@ import {
     merge,
     startWith,
     filter,
+    share,
+    repeat,
+    takeWhile,
 } from "rxjs";
 import { fromFetch } from "rxjs/fetch";
 
@@ -48,6 +51,7 @@ const Constants = {
     FLAP_VELOCITY: -400,
     PIPE_WIDTH: 50,
     TICK_RATE_MS: 16,
+    PIPE_SPEED: 120,
 } as const;
 
 // User input
@@ -77,6 +81,8 @@ type State = Readonly<{
     scoredIds: ReadonlyArray<number>;
     hurtCooldown: number;
     flapCooldown: number;
+
+    started: boolean;
 }>;
 
 const initialState: State = {
@@ -96,6 +102,8 @@ const initialState: State = {
     scoredIds: [],
     hurtCooldown: 0,
     flapCooldown: 0,
+
+    started: false,
 };
 
 // helper function for generating stream
@@ -227,7 +235,10 @@ const render = (): ((s: State) => void) => {
     return (s: State) => {
         // move bird
         birdImg.setAttribute("y", String(s.birdY));
-        restartText.setAttribute("visibility", s.gameEnd ? "visible" : "hidden");
+        restartText.setAttribute(
+            "visibility",
+            s.gameEnd ? "visible" : "hidden",
+        );
 
         // updates lives and score
         if (livesText) livesText.textContent = `Lives: ${s.lives}`;
@@ -283,283 +294,265 @@ const render = (): ((s: State) => void) => {
     };
 };
 
+// ChatGPT used to implement helper observables to get game restarting to work only at game end
+
 export const state$ = (csvContents: string): Observable<State> => {
-    const restart$ = merge(
-        fromEvent<KeyboardEvent>(document, "keydown").pipe(
-            filter(e => e.code === "KeyR"),
+    // split first vs subsequent clicks
+    const pointerDown$ = merge(
+        fromEvent<MouseEvent>(document, "mousedown"),
+        fromEvent<TouchEvent>(document, "touchstart"),
+    ).pipe(share());
+
+    // wait for the very first click/touch of a run
+    const firstClick$ = pointerDown$.pipe(take(1));
+
+    // flap reducer but gated until after first click
+    const rawFlap$ = pointerDown$.pipe(
+        map(
+            () =>
+                (s: State): State =>
+                    s.gameEnd || s.flapCooldown > 0
+                        ? s
+                        : {
+                              ...s,
+                              birdVy: Constants.FLAP_VELOCITY,
+                              flapCooldown: 0.12,
+                          },
         ),
-    ).pipe(startWith(null));
+    );
 
-    return restart$.pipe(
-        switchMap(() => {
-            // flap (ignore when over)
-            const flap$ = merge(
-                fromEvent<MouseEvent>(document, "mousedown"),
-                fromEvent<TouchEvent>(document, "touchstart"),
-            ).pipe(
-                map(
-                    () =>
-                        (s: State): State =>
-                            s.gameEnd || s.flapCooldown > 0
-                                ? s
-                                : {
-                                      ...s,
-                                      birdVy: Constants.FLAP_VELOCITY,
-                                      flapCooldown: 0.12,
-                                  },
-                ),
+    // time
+    const dt$ = interval(Constants.TICK_RATE_MS).pipe(
+        map(() => Constants.TICK_RATE_MS / 1000),
+    );
+
+    const random$ = dt$.pipe(
+        scan(seed => randStep(seed).nextSeed, 0xc0ffee),
+        map(seed => randStep(seed).value),
+    );
+
+    // csv pipe definitions
+    const parsePipes = (csv: string): ReadonlyArray<PipeDef> => {
+        const lines = csv
+            .split(/\r?\n/)
+            .map(l => l.trim())
+            .filter(Boolean);
+        const body = /^gap_y\s*,\s*gap_height\s*,\s*time/i.test(lines[0])
+            ? lines.slice(1)
+            : lines;
+
+        return body
+            .map(line => {
+                const [gy, gh, t] = line.split(",");
+                const gapYpx = Math.max(
+                    0,
+                    Math.min(
+                        Viewport.CANVAS_HEIGHT,
+                        Number(gy) * Viewport.CANVAS_HEIGHT,
+                    ),
+                );
+                const gapHpx = Math.max(
+                    10,
+                    Math.min(
+                        Viewport.CANVAS_HEIGHT,
+                        Number(gh) * Viewport.CANVAS_HEIGHT +
+                            Viewport.PIPE_GAP_TWEAK, // widen gaps
+                    ),
+                );
+                const time = Number(t);
+                return { time, gapYpx, gapHpx };
+            })
+            .filter(d => Number.isFinite(d.time))
+            .sort((a, b) => a.time - b.time);
+    };
+
+    const pipeDefs = parsePipes(csvContents);
+
+    // constants used in tick reducer
+    const PIPE_SPEED = 250;
+    const TOP = 0;
+    const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT - 65;
+    const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
+
+    // small pure partition helper
+    const partition = <T>(
+        xs: ReadonlyArray<T>,
+        pred: (x: T) => boolean,
+    ): [ReadonlyArray<T>, ReadonlyArray<T>] => {
+        const a: T[] = [],
+            b: T[] = [];
+        xs.forEach(x => (pred(x) ? a : b).push(x));
+        return [a, b];
+    };
+
+    // existing big tick reducer (basically same)
+    const tickCore$ = dt$.pipe(
+        withLatestFrom(random$),
+        map(([dt, r]) => (s: State): State => {
+            if (s.gameEnd) {
+                const vy = s.birdVy + Constants.GRAVITY * dt;
+                const y = s.birdY + vy * dt;
+                return { ...s, birdVy: vy, birdY: y, flapCooldown: 0 };
+            }
+
+            const elapsed = s.elapsed + dt;
+            const hurtCooldown = Math.max(0, s.hurtCooldown - dt);
+            const flapCooldown = Math.max(0, s.flapCooldown - dt);
+
+            const [due, future] = partition(
+                s.remainingDefs,
+                d => d.time <= elapsed,
             );
+            const spawned: ReadonlyArray<Pipe> = due.map((d, i) => ({
+                id: s.pipes.length + i + 1,
+                x: Viewport.CANVAS_WIDTH,
+                gapY: d.gapYpx,
+                gapH: d.gapHpx,
+            }));
 
-            // time
-            const dt$ = interval(Constants.TICK_RATE_MS).pipe(
-                map(() => Constants.TICK_RATE_MS / 1000),
-            );
+            const pipes = s.pipes
+                .concat(spawned)
+                .map(p => ({ ...p, x: p.x - PIPE_SPEED * dt }))
+                .filter(p => p.x + Constants.PIPE_WIDTH >= 0);
 
-            const random$ = dt$.pipe(
-                scan(seed => randStep(seed).nextSeed, 0xc0ffee),
-                map(seed => randStep(seed).value),
-            );
+            let birdVy = s.birdVy + Constants.GRAVITY * dt;
+            let birdY = s.birdY + birdVy * dt;
+            if (birdY >= GROUND) {
+                birdY = GROUND;
+                birdVy = 0;
+            }
+            if (birdY <= TOP) {
+                birdY = TOP;
+                birdVy = 0;
+            }
 
-            // csv pipe definitions
-            const parsePipes = (csv: string): ReadonlyArray<PipeDef> => {
-                const lines = csv
-                    .split(/\r?\n/)
-                    .map(l => l.trim())
-                    .filter(Boolean);
-                const body = /^gap_y\s*,\s*gap_height\s*,\s*time/i.test(
-                    lines[0],
+            const bumpDown = 150 + r * 200;
+            const bumpUp = 250 + r * 170;
+
+            let lives = s.lives;
+            let hit = false;
+
+            if (birdY <= TOP) {
+                hit = true;
+                birdVy = bumpDown;
+            }
+            if (birdY >= GROUND) {
+                hit = true;
+                birdVy = -bumpUp;
+                birdY = GROUND;
+            }
+
+            const overlaps = (
+                a: { x: number; y: number; w: number; h: number },
+                b: { x: number; y: number; w: number; h: number },
+            ) =>
+                a.x < b.x + b.w &&
+                a.x + a.w > b.x &&
+                a.y < b.y + b.h &&
+                a.y + a.h > b.y;
+
+            const birdBox = {
+                x: birdX,
+                y: birdY,
+                w: Birb.WIDTH,
+                h: Birb.HEIGHT,
+            };
+            for (const p of pipes) {
+                const half = p.gapH / 2;
+                const topH = Math.max(0, p.gapY - half);
+                const botY = Math.min(Viewport.CANVAS_HEIGHT, p.gapY + half);
+                const topRect = {
+                    x: p.x,
+                    y: 0,
+                    w: Constants.PIPE_WIDTH,
+                    h: topH,
+                };
+                const botRect = {
+                    x: p.x,
+                    y: botY,
+                    w: Constants.PIPE_WIDTH,
+                    h: Viewport.CANVAS_HEIGHT - botY,
+                };
+                if (overlaps(birdBox, topRect)) {
+                    hit = true;
+                    birdVy = bumpDown;
+                    break;
+                }
+                if (overlaps(birdBox, botRect)) {
+                    hit = true;
+                    birdVy = -bumpUp;
+                    break;
+                }
+            }
+
+            if (hit && hurtCooldown <= 0 && !s.gameEnd) {
+                lives = Math.max(0, lives - 1);
+            }
+
+            const gameEnd = lives <= 0;
+            if (s.gameEnd) return { ...s, flapCooldown: 0 };
+
+            const birdRight = birdX + Birb.WIDTH;
+            const newlyPassed = pipes
+                .filter(
+                    p =>
+                        p.x + Constants.PIPE_WIDTH < birdRight &&
+                        !s.scoredIds.includes(p.id),
                 )
-                    ? lines.slice(1)
-                    : lines;
+                .map(p => p.id);
 
-                return body
-                    .map(line => {
-                        const [gy, gh, t] = line.split(",");
-                        const gapYpx = Math.max(
-                            0,
-                            Math.min(
-                                Viewport.CANVAS_HEIGHT,
-                                Number(gy) * Viewport.CANVAS_HEIGHT,
-                            ),
-                        );
-                        const gapHpx = Math.max(
-                            10,
-                            Math.min(
-                                Viewport.CANVAS_HEIGHT,
-                                Number(gh) * Viewport.CANVAS_HEIGHT,
-                            ),
-                        );
-                        const time = Number(t);
-                        return { time, gapYpx, gapHpx };
-                    })
-                    .filter(d => Number.isFinite(d.time))
-                    .sort((a, b) => a.time - b.time);
+            const score = s.score + newlyPassed.length;
+            const scoredIds = newlyPassed.length
+                ? s.scoredIds.concat(newlyPassed)
+                : s.scoredIds;
+
+            return {
+                ...s,
+                elapsed,
+                flapCooldown,
+                remainingDefs: future,
+                pipes,
+                birdY,
+                birdVy,
+                lives,
+                score,
+                scoredIds,
+                hurtCooldown:
+                    hit && hurtCooldown <= 0 && !gameEnd ? 0.6 : hurtCooldown,
+                gameEnd,
             };
-
-            const pipeDefs = parsePipes(csvContents);
-
-            // currently difficult to make it through pipes
-            // may need to change pipe speed value later
-            const PIPE_SPEED = 250;
-            const TOP = 0;
-            const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT - 65;
-            const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
-
-            // small pure partition helper
-            const partition = <T>(
-                xs: ReadonlyArray<T>,
-                pred: (x: T) => boolean,
-            ): [ReadonlyArray<T>, ReadonlyArray<T>] => {
-                const a: T[] = [],
-                    b: T[] = [];
-                xs.forEach(x => (pred(x) ? a : b).push(x));
-                return [a, b];
-            };
-
-            // tick reducer
-            const tick$ = dt$.pipe(
-                withLatestFrom(random$),
-                map(([dt, r]) => (s: State): State => {
-                    if (s.gameEnd) {
-                        const vy = s.birdVy + Constants.GRAVITY * dt;
-                        // player can fall through ground (accurate to real flappy bird btw)
-                        const y = s.birdY + vy * dt;
-                        return {
-                            ...s,
-                            birdVy: vy,
-                            birdY: y,
-
-                            // player can't flap
-                            flapCooldown: 0,
-                        };
-                    }
-
-                    // advance time and cooldown
-                    const elapsed = s.elapsed + dt;
-                    const hurtCooldown = Math.max(0, s.hurtCooldown - dt);
-                    const flapCooldown = Math.max(0, s.flapCooldown - dt);
-
-                    // spawn any definitions whose time has arrived
-                    const [due, future] = partition(
-                        s.remainingDefs,
-                        d => d.time <= elapsed,
-                    );
-                    const spawned: ReadonlyArray<Pipe> = due.map((d, i) => ({
-                        id: s.pipes.length + i + 1,
-
-                        // pipes appear at right edge
-                        x: Viewport.CANVAS_WIDTH,
-
-                        gapY: d.gapYpx,
-                        gapH: d.gapHpx,
-                    }));
-
-                    // move existing + spawned pipes left get culled off screen
-                    const pipes = s.pipes
-                        .concat(spawned)
-                        .map(p => ({ ...p, x: p.x - PIPE_SPEED * dt }))
-                        .filter(p => p.x + Constants.PIPE_WIDTH >= 0);
-
-                    // gravity physics
-                    let birdVy = s.birdVy + Constants.GRAVITY * dt;
-                    let birdY = s.birdY + birdVy * dt;
-                    if (birdY >= GROUND) {
-                        birdY = GROUND;
-                        birdVy = 0;
-                    }
-                    if (birdY <= TOP) {
-                        birdY = TOP;
-                        birdVy = 0;
-                    }
-
-                    // all collisions (ground, top of display, pipes)
-
-                    const bumpDown = 150 + r * 200;
-                    const bumpUp = 250 + r * 170;
-
-                    let lives = s.lives;
-                    let hit = false;
-
-                    // screen edge hits
-                    if (birdY <= TOP) {
-                        hit = true;
-                        birdVy = bumpDown;
-                    }
-                    if (birdY >= GROUND) {
-                        hit = true;
-                        birdVy = -bumpUp;
-                        birdY = GROUND;
-                    }
-
-                    // pipe hits
-                    const overlaps = (
-                        a: { x: number; y: number; w: number; h: number },
-                        b: { x: number; y: number; w: number; h: number },
-                    ) =>
-                        a.x < b.x + b.w &&
-                        a.x + a.w > b.x &&
-                        a.y < b.y + b.h &&
-                        a.y + a.h > b.y;
-
-                    const birdBox = {
-                        x: birdX,
-                        y: birdY,
-                        w: Birb.WIDTH,
-                        h: Birb.HEIGHT,
-                    };
-                    for (const p of pipes) {
-                        const half = p.gapH / 2;
-                        const topH = Math.max(0, p.gapY - half);
-                        const botY = Math.min(
-                            Viewport.CANVAS_HEIGHT,
-                            p.gapY + half,
-                        );
-                        const topRect = {
-                            x: p.x,
-                            y: 0,
-                            w: Constants.PIPE_WIDTH,
-                            h: topH,
-                        };
-                        const botRect = {
-                            x: p.x,
-                            y: botY,
-                            w: Constants.PIPE_WIDTH,
-                            h: Viewport.CANVAS_HEIGHT - botY,
-                        };
-
-                        if (overlaps(birdBox, topRect)) {
-                            hit = true;
-                            birdVy = bumpDown;
-                            break;
-                        }
-                        if (overlaps(birdBox, botRect)) {
-                            hit = true;
-                            birdVy = -bumpUp;
-                            break;
-                        }
-                    }
-
-                    // apply damage once per cooldown window
-                    if (hit && hurtCooldown <= 0 && !s.gameEnd) {
-                        lives = Math.max(0, lives - 1);
-                    }
-
-                    const gameEnd = lives <= 0;
-
-                    if (s.gameEnd) {
-                        return { ...s, flapCooldown: 0 };
-                    }
-
-                    // scoring when passing a pipe
-                    // bird passes when its right edge has gone beyond pipes right edge
-                    const birdRight = birdX + Birb.WIDTH;
-                    const newlyPassed = pipes
-                        .filter(
-                            p =>
-                                p.x + Constants.PIPE_WIDTH < birdRight &&
-                                !s.scoredIds.includes(p.id),
-                        )
-                        .map(p => p.id);
-
-                    const score = s.score + newlyPassed.length;
-                    const scoredIds = newlyPassed.length
-                        ? s.scoredIds.concat(newlyPassed)
-                        : s.scoredIds;
-
-                    // final next state
-                    return {
-                        ...s,
-                        elapsed,
-                        flapCooldown,
-                        remainingDefs: future,
-                        pipes,
-                        birdY,
-                        birdVy,
-                        lives,
-                        score,
-                        scoredIds,
-                        hurtCooldown:
-                            hit && hurtCooldown <= 0 && !gameEnd
-                                ? 0.6
-                                : hurtCooldown, // 600ms invuln
-                        gameEnd,
-                    };
-                }),
-            );
-
-            // seeds initial state
-            const seededInitial: State = {
-                ...initialState,
-                elapsed: 0,
-                remainingDefs: pipeDefs,
-            };
-
-            // final state$
-            return merge(tick$, flap$).pipe(
-                scan((s, reduce) => reduce(s), seededInitial),
-            );
         }),
     );
+
+    // Gate physics/flaps until the first click of the run
+    const tick$ = firstClick$.pipe(switchMap(() => tickCore$));
+    const gatedFlap$ = firstClick$.pipe(switchMap(() => rawFlap$));
+
+    // Seeded initial state (reset immediately on R)
+    const seededInitial: State = {
+        ...initialState,
+        elapsed: 0,
+        remainingDefs: pipeDefs,
+    };
+
+    // Build one run: emit initial state immediately, then evolve with reducers
+    const run$ = merge(
+        // emit initial state right away
+        merge(tick$, gatedFlap$).pipe(startWith((s: State) => s)),
+    ).pipe(
+        scan((s, reduce) => reduce(s), seededInitial),
+        // complete the run once game ends (include the gameEnd state)
+        // so we can wait for R and then start a fresh run
+        takeWhile(s => !s.gameEnd, true),
+    );
+
+    // R restarts ONLY after game over (pressing R mid-run does nothing)
+    const restartKey$ = fromEvent<KeyboardEvent>(document, "keydown").pipe(
+        filter(e => e.code === "KeyR"),
+    );
+
+    // Repeat a fresh run when R is pressed *after* completion
+    return run$.pipe(repeat({ delay: () => restartKey$ }));
 };
 
 // The following simply runs your main function on window load.  Make sure to leave it in place.
