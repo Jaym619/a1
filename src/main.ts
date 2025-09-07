@@ -97,8 +97,8 @@ type State = Readonly<{
 
     started: boolean;
 
-    // not storing each position just for render
-    ghostY: number | null;
+    // stores ALL ghosts now (originally showed only previous)
+    ghostYs: ReadonlyArray<number>;
 }>;
 
 const initialState: State = {
@@ -122,7 +122,7 @@ const initialState: State = {
 
     started: false,
 
-    ghostY: null,
+    ghostYs: [],
 };
 
 // helper function for generating stream
@@ -229,16 +229,16 @@ const render = (): ((s: State) => void) => {
     svg.appendChild(birdImg);
 
     // Ghost Bird
-    const ghostImg = createSvgElement(svg.namespaceURI, "image", {
-        id: "ghost",
+    const ghostsG = createSvgElement(svg.namespaceURI, "g", {
+        id: "ghosts",
         href: "assets/birb.png",
         x: String(Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2),
         y: String(initialState.birdY),
         width: String(Birb.WIDTH),
         height: String(Birb.HEIGHT),
-        opacity: "0.35",
+        opacity: "0.5",
     }) as SVGImageElement;
-    svg.appendChild(ghostImg);
+    svg.appendChild(ghostsG);
 
     // Restart prompt (initially hidden)
     const restartText = createSvgElement(svg.namespaceURI, "text", {
@@ -271,12 +271,20 @@ const render = (): ((s: State) => void) => {
             s.gameEnd ? "visible" : "hidden",
         );
 
-        // show ghost only when there is a previous turn
-        if (s.ghostY == null) {
-            ghostImg.setAttribute("visibility", "hidden");
-        } else {
-            ghostImg.setAttribute("visibility", "visible");
-            ghostImg.setAttribute("y", String(s.ghostY));
+        // draw ghosts (one per previous run)
+        ghostsG.innerHTML = "";
+        if (s.ghostYs.length > 0) {
+            s.ghostYs.forEach(y => {
+                const gi = createSvgElement(svg.namespaceURI, "image", {
+                    href: "assets/birb.png",
+                    x: String(Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2),
+                    y: String(y),
+                    width: String(Birb.WIDTH),
+                    height: String(Birb.HEIGHT),
+                    opacity: "0.32",
+                });
+                ghostsG.appendChild(gi);
+            });
         }
 
         // updates lives and score
@@ -337,7 +345,9 @@ const render = (): ((s: State) => void) => {
 
 export const state$ = (csvContents: string): Observable<State> => {
     // previous run’s recording
-    const ghostPrev$ = new BehaviorSubject<Observable<number>>(EMPTY);
+    const ghostPrevAll$ = new BehaviorSubject<
+        ReadonlyArray<Observable<number>>
+    >([]);
 
     // constants
     const TOP = 0;
@@ -599,7 +609,7 @@ export const state$ = (csvContents: string): Observable<State> => {
                 ...initialState,
                 elapsed: 0,
                 remainingDefs: pipeDefs,
-                ghostY: null,
+                ghostYs: [],
                 started: false,
             }),
         );
@@ -618,23 +628,35 @@ export const state$ = (csvContents: string): Observable<State> => {
 
         const flapForRun$ = startClick$.pipe(switchMap(() => rawFlap$));
 
-        // ghost playback
+        // after first click start ghosts
         const ghostPlaybackReducerForRun$ = startClick$.pipe(
             switchMap(() =>
-                ghostPrev$.pipe(
-                    // read the current previous run
+                ghostPrevAll$.pipe(
                     take(1),
-                    switchMap(prev$ =>
-                        prev$.pipe(
-                            // thought this would fix the lag on the second ghost BUT DID NOT
-                            observeOn(animationFrameScheduler),
-                            zipWith(dtForRun$),
-                            map(
-                                ([y]) =>
-                                    (s: State): State => ({ ...s, ghostY: y }),
+                    switchMap(recs => {
+                        if (recs.length === 0) return EMPTY;
+
+                        // one paced stream per prior run
+                        const paced = recs.map(rec$ =>
+                            rec$.pipe(
+                                observeOn(animationFrameScheduler),
+                                zipWith(dtForRun$),
                             ),
-                        ),
-                    ),
+                        );
+
+                        // map each ghost to a reducer that writes its y into ghostYs
+                        return merge(
+                            ...paced.map((y$, i) =>
+                                y$.pipe(
+                                    map(([y]) => (s: State): State => {
+                                        const ys = s.ghostYs.slice(0);
+                                        ys[i] = y;
+                                        return { ...s, ghostYs: ys };
+                                    }),
+                                ),
+                            ),
+                        );
+                    }),
                 ),
             ),
         );
@@ -682,7 +704,10 @@ export const state$ = (csvContents: string): Observable<State> => {
 
         // frozen recording when the run completes
         return merge(keepRecorderHot$, runBase$).pipe(
-            finalize(() => ghostPrev$.next(thisRunRecording$)),
+            finalize(() => {
+                const prev = ghostPrevAll$.getValue(); // OK in RxJS; read-only snapshot
+                ghostPrevAll$.next(prev.concat(thisRunRecording$));
+            }),
         );
     });
     return runOnce$.pipe(repeat());
