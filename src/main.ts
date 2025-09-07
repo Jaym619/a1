@@ -79,6 +79,7 @@ type State = Readonly<{
     remainingDefs: ReadonlyArray<PipeDef>;
 
     scoredIds: ReadonlyArray<number>;
+    nextPipeId: number;
     hurtCooldown: number;
     flapCooldown: number;
 
@@ -100,6 +101,7 @@ const initialState: State = {
     remainingDefs: [],
 
     scoredIds: [],
+    nextPipeId: 1,
     hurtCooldown: 0,
     flapCooldown: 0,
 
@@ -404,7 +406,7 @@ export const state$ = (csvContents: string): Observable<State> => {
                 d => d.time <= elapsed,
             );
             const spawned: ReadonlyArray<Pipe> = due.map((d, i) => ({
-                id: s.pipes.length + i + 1,
+                id: s.nextPipeId + i,
                 x: Viewport.CANVAS_WIDTH,
                 gapY: d.gapYpx,
                 gapH: d.gapHpx,
@@ -489,9 +491,11 @@ export const state$ = (csvContents: string): Observable<State> => {
                 lives = Math.max(0, lives - 1);
             }
 
-            const gameEnd = lives <= 0;
+            const levelComplete = future.length === 0 && pipes.length === 0;
+            const gameEnd = lives <= 0 || levelComplete;
             if (s.gameEnd) return { ...s, flapCooldown: 0 };
 
+            // keeps track of score (pipes passed)
             const birdRight = birdX + Birb.WIDTH;
             const newlyPassed = pipes
                 .filter(
@@ -516,6 +520,7 @@ export const state$ = (csvContents: string): Observable<State> => {
                 birdVy,
                 lives,
                 score,
+                nextPipeId: s.nextPipeId + due.length,
                 scoredIds,
                 hurtCooldown:
                     hit && hurtCooldown <= 0 && !gameEnd ? 0.6 : hurtCooldown,
