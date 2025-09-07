@@ -25,17 +25,20 @@ import {
     switchMap,
     take,
     merge,
-    startWith,
+    of,
     filter,
     share,
     repeat,
-    takeWhile,
+    takeUntil,
     shareReplay,
-    skipUntil,
+    defer,
     EMPTY,
     zipWith,
     finalize,
     BehaviorSubject,
+    ignoreElements,
+    animationFrameScheduler,
+    observeOn,
 } from "rxjs";
 import { fromFetch } from "rxjs/fetch";
 
@@ -251,13 +254,13 @@ const render = (): ((s: State) => void) => {
     }) as SVGTextElement;
     restartText.textContent = "Press R to restart";
     restartText.setAttribute("visibility", "hidden");
-    svg.appendChild(restartText);
 
     // create pipes group once
     const pipesG = createSvgElement(svg.namespaceURI, "g", {
         id: "pipes",
     }) as SVGGElement;
     svg.appendChild(pipesG);
+    svg.appendChild(restartText);
 
     // frame updater
     return (s: State) => {
@@ -336,24 +339,31 @@ export const state$ = (csvContents: string): Observable<State> => {
     // previous run’s recording
     const ghostPrev$ = new BehaviorSubject<Observable<number>>(EMPTY);
 
-    // input
-    const pointerDown$ = merge(
-        fromEvent<MouseEvent>(document, "mousedown"),
-        fromEvent<TouchEvent>(document, "touchstart"),
-    ).pipe(share());
-    const firstClick$ = pointerDown$.pipe(take(1));
+    // constants
+    const TOP = 0;
+    const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT - 65;
+    const PIPE_SPEED = 250;
+    const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
 
-    // time
-    const dt$ = interval(Constants.TICK_RATE_MS).pipe(
-        map(() => Constants.TICK_RATE_MS / 1000),
-    );
+    // helpers
+    const partition = <T>(
+        xs: ReadonlyArray<T>,
+        pred: (x: T) => boolean,
+    ): [ReadonlyArray<T>, ReadonlyArray<T>] => {
+        const a: T[] = [],
+            b: T[] = [];
+        xs.forEach(x => (pred(x) ? a : b).push(x));
+        return [a, b];
+    };
 
-    const random$ = dt$.pipe(
-        scan(seed => randStep(seed).nextSeed, 0xc0ffee),
-        map(seed => randStep(seed).value),
-    );
+    const randStep = (seed: number) => {
+        const a = 1664525,
+            c = 1013904223,
+            m = 2 ** 32;
+        const next = (a * seed + c) >>> 0;
+        return { nextSeed: next, value: next / m };
+    };
 
-    // parse CSV (your logic + gap tweak)
     const parsePipes = (csv: string): ReadonlyArray<PipeDef> => {
         const lines = csv
             .split(/\r?\n/)
@@ -389,22 +399,19 @@ export const state$ = (csvContents: string): Observable<State> => {
     };
     const pipeDefs = parsePipes(csvContents);
 
-    // constants
-    const PIPE_SPEED = 250;
-    const TOP = 0;
-    const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT - 65;
-    const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
+    // global streams
+    const pointerDown$ = merge(
+        fromEvent<MouseEvent>(document, "mousedown"),
+        fromEvent<TouchEvent>(document, "touchstart"),
+    ).pipe(share());
 
-    // small helper
-    const partition = <T>(
-        xs: ReadonlyArray<T>,
-        pred: (x: T) => boolean,
-    ): [ReadonlyArray<T>, ReadonlyArray<T>] => {
-        const a: T[] = [],
-            b: T[] = [];
-        xs.forEach(x => (pred(x) ? a : b).push(x));
-        return [a, b];
-    };
+    const restartKey$ = fromEvent<KeyboardEvent>(document, "keydown").pipe(
+        filter(e => e.code === "KeyR"),
+    );
+
+    const baseDt$ = interval(Constants.TICK_RATE_MS).pipe(
+        map(() => Constants.TICK_RATE_MS / 1000),
+    );
 
     // flap reducer gated until first click
     const rawFlap$ = pointerDown$.pipe(
@@ -420,22 +427,31 @@ export const state$ = (csvContents: string): Observable<State> => {
                           },
         ),
     );
-    const gatedFlap$ = firstClick$.pipe(switchMap(() => rawFlap$));
 
-    // tick reducer
-    const tickCore$ = dt$.pipe(
-        withLatestFrom(random$),
-        map(([dt, r]) => (s: State): State => {
+    // physics reducer
+    const stepReducer =
+        (dt: number, r: number) =>
+        (s: State): State => {
+            // keep falling after game end (no clamping)
             if (s.gameEnd) {
-                const vy = s.birdVy + Constants.GRAVITY * dt;
-                const y = s.birdY + vy * dt;
-                return { ...s, birdVy: vy, birdY: y, flapCooldown: 0 };
+                const birdVy = s.birdVy + Constants.GRAVITY * dt;
+                const birdY = s.birdY + birdVy * dt;
+                return { ...s, birdVy, birdY, flapCooldown: 0 };
             }
+
+            // before first click do nothing
+            if (!s.started) return s;
+
+            const TOP = 0;
+            const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT - 65;
+            const PIPE_SPEED = 250;
+            const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
 
             const elapsed = s.elapsed + dt;
             const hurtCooldown = Math.max(0, s.hurtCooldown - dt);
             const flapCooldown = Math.max(0, s.flapCooldown - dt);
 
+            // spawn and move pipes
             const [due, future] = partition(
                 s.remainingDefs,
                 d => d.time <= elapsed,
@@ -452,6 +468,7 @@ export const state$ = (csvContents: string): Observable<State> => {
                 .map(p => ({ ...p, x: p.x - PIPE_SPEED * dt }))
                 .filter(p => p.x + Constants.PIPE_WIDTH >= 0);
 
+            // bird physics (clamp only while alive)
             let birdVy = s.birdVy + Constants.GRAVITY * dt;
             let birdY = s.birdY + birdVy * dt;
             if (birdY >= GROUND) {
@@ -463,6 +480,7 @@ export const state$ = (csvContents: string): Observable<State> => {
                 birdVy = 0;
             }
 
+            // collisions
             const bumpDown = 150 + r * 200;
             const bumpUp = 250 + r * 170;
 
@@ -517,15 +535,14 @@ export const state$ = (csvContents: string): Observable<State> => {
                 }
             }
 
-            if (hit && hurtCooldown <= 0 && !s.gameEnd) {
+            if (hit && hurtCooldown <= 0) {
                 lives = Math.max(0, lives - 1);
             }
 
-            // end condition
             const levelComplete = future.length === 0 && pipes.length === 0;
             const gameEnd = lives <= 0 || levelComplete;
-            if (s.gameEnd) return { ...s, flapCooldown: 0 };
 
+            // scoring
             const birdRight = birdX + Birb.WIDTH;
             const newlyPassed = pipes
                 .filter(
@@ -555,69 +572,120 @@ export const state$ = (csvContents: string): Observable<State> => {
                     hit && hurtCooldown <= 0 && !gameEnd ? 0.6 : hurtCooldown,
                 gameEnd,
             };
-        }),
-    );
-    const tick$ = firstClick$.pipe(switchMap(() => tickCore$));
+        };
 
-    // ghost playback
-    const ghostPlaybackReducer$ = firstClick$.pipe(
-        switchMap(() =>
-            ghostPrev$.pipe(
-                // read the current previous run
-                take(1),
-                switchMap(prev$ =>
-                    prev$.pipe(
-                        // pace with current run ticks
-                        zipWith(dt$),
-                        map(
-                            ([y]) =>
-                                (s: State): State => ({ ...s, ghostY: y }),
+    // one run
+    const runOnce$ = defer(() => {
+        // per run start click
+        const startClick$ = merge(
+            fromEvent<MouseEvent>(document, "mousedown"),
+            fromEvent<TouchEvent>(document, "touchstart"),
+        ).pipe(take(1), share());
+
+        // reducer will not until started
+        const dtForRun$ = interval(Constants.TICK_RATE_MS).pipe(
+            map(() => Constants.TICK_RATE_MS / 1000),
+            share(),
+        );
+        // RNG tied to dt
+        const randomForRun$ = dtForRun$.pipe(
+            scan(seed => randStep(seed).nextSeed, 0xc0ffee),
+            map(seed => randStep(seed).value),
+        );
+
+        // reducers
+        const resetReducer$ = of(
+            (_: State): State => ({
+                ...initialState,
+                elapsed: 0,
+                remainingDefs: pipeDefs,
+                ghostY: null,
+                started: false,
+            }),
+        );
+
+        const startReducer$ = startClick$.pipe(
+            map(
+                () =>
+                    (s: State): State => ({ ...s, started: true }),
+            ),
+        );
+
+        const tickForRun$ = dtForRun$.pipe(
+            withLatestFrom(randomForRun$),
+            map(([dt, r]) => stepReducer(dt, r)),
+        );
+
+        const flapForRun$ = startClick$.pipe(switchMap(() => rawFlap$));
+
+        // ghost playback
+        const ghostPlaybackReducerForRun$ = startClick$.pipe(
+            switchMap(() =>
+                ghostPrev$.pipe(
+                    // read the current previous run
+                    take(1),
+                    switchMap(prev$ =>
+                        prev$.pipe(
+                            // thought this would fix the lag on the second ghost BUT DID NOT
+                            observeOn(animationFrameScheduler),
+                            zipWith(dtForRun$),
+                            map(
+                                ([y]) =>
+                                    (s: State): State => ({ ...s, ghostY: y }),
+                            ),
                         ),
                     ),
                 ),
             ),
-        ),
-    );
+        );
 
-    // Seeded initial state (reset immediately on R)
-    const seededInitial: State = {
-        ...initialState,
-        elapsed: 0,
-        remainingDefs: pipeDefs,
-        // hides ghost until we have a previous run
-        ghostY: null,
-    };
+        // build one run and merge all reducers into a single scan
+        const reducersForRun$ = merge(
+            resetReducer$,
+            startReducer$,
+            tickForRun$,
+            flapForRun$,
+            ghostPlaybackReducerForRun$,
+        );
 
-    // build one run: merge all reducers into a single scan
-    const reducers$ = merge(tick$, gatedFlap$, ghostPlaybackReducer$);
+        // builds the raw run stream
+        const runBaseRaw$ = reducersForRun$.pipe(
+            scan((s, reduce) => reduce(s), initialState),
+            share(),
+        );
 
-    const runBase$ = reducers$.pipe(
-        startWith((s: State) => s), // emit reset state immediately
-        scan((s, reduce) => reduce(s), seededInitial),
-        // complete the run once game ends (include the gameEnd state)
-        // so we can wait for R and then start a fresh run
-        takeWhile(s => !s.gameEnd, true),
-        share(),
-    );
+        // detects when the game has ended
+        const gameOver$ = runBaseRaw$.pipe(
+            filter(s => s.gameEnd), // lives <= 0 or level complete
+            take(1),
+        );
 
-    // R restarts ONLY after game over (pressing R mid-run does nothing)
-    // record this run’s birdY as observable no array
-    const recording$ = runBase$.pipe(
-        skipUntil(firstClick$),
-        map(s => s.birdY),
-        shareReplay({ bufferSize: Infinity, refCount: false }),
-    );
+        // only allows R to end the run after gameover
+        const endOnRestartAfterOver$ = gameOver$.pipe(
+            switchMap(() => restartKey$.pipe(take(1))),
+        );
 
-    // publish the recording when the run completes
-    const run$ = runBase$.pipe(finalize(() => ghostPrev$.next(recording$)));
+        // final run stream
+        const runBase$ = runBaseRaw$.pipe(
+            takeUntil(endOnRestartAfterOver$),
+            share(),
+        );
 
-    // restart only AFTER game over (press R)
-    const restartKey$ = fromEvent<KeyboardEvent>(document, "keydown").pipe(
-        filter(e => e.code === "KeyR"),
-    );
+        // record this run
+        const thisRunRecording$ = runBase$.pipe(
+            map(s => s.birdY),
+            shareReplay({ bufferSize: Infinity, refCount: false }),
+        );
 
-    // Repeat a fresh run when R is pressed *after* completion
-    return run$.pipe(repeat({ delay: () => restartKey$.pipe(take(1)) }));
+        // keep recorder subscribed but emit nothing
+        const keepRecorderHot$ = thisRunRecording$.pipe(ignoreElements());
+
+        // frozen recording when the run completes
+        return merge(keepRecorderHot$, runBase$).pipe(
+            finalize(() => ghostPrev$.next(thisRunRecording$)),
+        );
+    });
+    return runOnce$.pipe(repeat());
 };
 
 // The following simply runs your main function on window load.  Make sure to leave it in place.
