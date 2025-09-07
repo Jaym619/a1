@@ -58,7 +58,7 @@ const Constants = {
     FLAP_VELOCITY: -400,
     PIPE_WIDTH: 50,
     TICK_RATE_MS: 16,
-    PIPE_SPEED: 120,
+    PIPE_SPEED: 250,
 } as const;
 
 // User input
@@ -226,18 +226,6 @@ const render = (): ((s: State) => void) => {
     }) as SVGImageElement;
     svg.appendChild(birdImg);
 
-    // Ghost Bird
-    const ghostsG = createSvgElement(svg.namespaceURI, "g", {
-        id: "ghosts",
-        href: "assets/birb.png",
-        x: String(Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2),
-        y: String(initialState.birdY),
-        width: String(Birb.WIDTH),
-        height: String(Birb.HEIGHT),
-        opacity: "0.5",
-    }) as SVGImageElement;
-    svg.appendChild(ghostsG);
-
     // Restart prompt (initially hidden)
     const restartText = createSvgElement(svg.namespaceURI, "text", {
         x: String(Viewport.CANVAS_WIDTH / 2),
@@ -260,6 +248,13 @@ const render = (): ((s: State) => void) => {
     svg.appendChild(pipesG);
     svg.appendChild(restartText);
 
+    // Ghosts container + reusable node cache (created once)
+    const ghostsG = createSvgElement(svg.namespaceURI, "g", {
+        id: "ghosts",
+    }) as SVGGElement;
+    svg.appendChild(ghostsG);
+    const ghostImgs: SVGImageElement[] = []; // cache for ghosts
+
     // frame updater
     return (s: State) => {
         // move bird
@@ -269,50 +264,27 @@ const render = (): ((s: State) => void) => {
             s.gameEnd ? "visible" : "hidden",
         );
 
-        // draw ghosts (one per previous run)
-        ghostsG.innerHTML = "";
-        if (s.ghostYs.length > 0) {
-            s.ghostYs.forEach(y => {
-                const gi = createSvgElement(svg.namespaceURI, "image", {
-                    href: "assets/birb.png",
-                    x: String(Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2),
-                    y: String(y),
-                    width: String(Birb.WIDTH),
-                    height: String(Birb.HEIGHT),
-                    opacity: "0.32",
-                });
-                ghostsG.appendChild(gi);
-            });
+        // update ghosts only (no innerHTML clears)
+        while (ghostImgs.length < s.ghostYs.length) {
+            const gi = createSvgElement(svg.namespaceURI, "image", {
+                href: "assets/birb.png",
+                x: String(Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2),
+                y: "0",
+                width: String(Birb.WIDTH),
+                height: String(Birb.HEIGHT),
+                opacity: "0.5",
+                "pointer-events": "none",
+            }) as SVGImageElement;
+            ghostsG.appendChild(gi);
+            ghostImgs.push(gi);
         }
-
-        const ghostImgs: SVGImageElement[] = [];
-        {
-            // ensure enough image nodes exist
-            while (ghostImgs.length < s.ghostYs.length) {
-                const gi = createSvgElement(svg.namespaceURI, "image", {
-                    href: "assets/birb.png",
-                    x: String(Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2),
-                    y: "0",
-                    width: String(Birb.WIDTH),
-                    height: String(Birb.HEIGHT),
-                    opacity: "0.32",
-                    "pointer-events": "none",
-                }) as SVGImageElement;
-                ghostsG.appendChild(gi);
-                ghostImgs.push(gi);
+        ghostImgs.forEach((img, i) => {
+            const visible = i < s.ghostYs.length;
+            img.setAttribute("visibility", visible ? "visible" : "hidden");
+            if (visible) {
+                img.setAttribute("y", String(s.ghostYs[i]));
             }
-
-            // show or update only the ghosts we need this frame
-            for (let i = 0; i < ghostImgs.length; i++) {
-                const img = ghostImgs[i];
-                if (i < s.ghostYs.length) {
-                    img.setAttribute("visibility", "visible");
-                    img.setAttribute("y", String(s.ghostYs[i]));
-                } else {
-                    img.setAttribute("visibility", "hidden");
-                }
-            }
-        }
+        });
 
         // updates lives and score
         if (livesText) livesText.textContent = `Lives: ${s.lives}`;
@@ -379,7 +351,6 @@ export const state$ = (csvContents: string): Observable<State> => {
     // constants
     const TOP = 0;
     const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT - 65;
-    const PIPE_SPEED = 250;
     const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
 
     // helpers
@@ -391,14 +362,6 @@ export const state$ = (csvContents: string): Observable<State> => {
             b: T[] = [];
         xs.forEach(x => (pred(x) ? a : b).push(x));
         return [a, b];
-    };
-
-    const randStep = (seed: number) => {
-        const a = 1664525,
-            c = 1013904223,
-            m = 2 ** 32;
-        const next = (a * seed + c) >>> 0;
-        return { nextSeed: next, value: next / m };
     };
 
     const parsePipes = (csv: string): ReadonlyArray<PipeDef> => {
@@ -446,10 +409,6 @@ export const state$ = (csvContents: string): Observable<State> => {
         filter(e => e.code === "KeyR"),
     );
 
-    const baseDt$ = interval(Constants.TICK_RATE_MS).pipe(
-        map(() => Constants.TICK_RATE_MS / 1000),
-    );
-
     // flap reducer gated until first click
     const rawFlap$ = pointerDown$.pipe(
         map(
@@ -465,6 +424,90 @@ export const state$ = (csvContents: string): Observable<State> => {
         ),
     );
 
+    // geometry helpers (pure)
+    const overlaps = (
+        a: { x: number; y: number; w: number; h: number },
+        b: { x: number; y: number; w: number; h: number },
+    ) =>
+        a.x < b.x + b.w &&
+        a.x + a.w > b.x &&
+        a.y < b.y + b.h &&
+        a.y + a.h > b.y;
+
+    const integrate = (s: State, dt: number) => ({
+        birdVy: s.birdVy + Constants.GRAVITY * dt,
+        birdY: s.birdY + (s.birdVy + Constants.GRAVITY * dt) * dt,
+    });
+
+    // only clamp when game not over
+    const clampAlive = (y: number, vy: number, TOP: number, GROUND: number) => {
+        if (y >= GROUND) return { y: GROUND, vy: 0 };
+        if (y <= TOP) return { y: TOP, vy: 0 };
+        return { y, vy };
+    };
+
+    const spawnDue = (
+        defs: ReadonlyArray<PipeDef>,
+        elapsed: number,
+        nextId: number,
+    ) => {
+        const due = defs.filter(d => d.time <= elapsed);
+        const future = defs.slice(due.length);
+        const spawned = due.map((d, i) => ({
+            id: nextId + i,
+            x: Viewport.CANVAS_WIDTH,
+            gapY: d.gapYpx,
+            gapH: d.gapHpx,
+        }));
+        return { spawned, future };
+    };
+
+    const movePipes = (pipes: ReadonlyArray<Pipe>, dt: number) =>
+        pipes
+            .map(p => ({ ...p, x: p.x - Constants.PIPE_SPEED * dt }))
+            .filter(p => p.x + Constants.PIPE_WIDTH >= 0);
+
+    const collide = (
+        birdBox: { x: number; y: number; w: number; h: number },
+        pipes: ReadonlyArray<Pipe>,
+        r: number,
+    ) => {
+        const bumpDown = 150 + r * 200,
+            bumpUp = 250 + r * 170;
+        for (const p of pipes) {
+            const half = p.gapH / 2,
+                topH = Math.max(0, p.gapY - half);
+            const botY = Math.min(Viewport.CANVAS_HEIGHT, p.gapY + half);
+            const topR = { x: p.x, y: 0, w: Constants.PIPE_WIDTH, h: topH };
+            const botR = {
+                x: p.x,
+                y: botY,
+                w: Constants.PIPE_WIDTH,
+                h: Viewport.CANVAS_HEIGHT - botY,
+            };
+            if (overlaps(birdBox, topR))
+                return { hit: true, vy: bumpDown, y: birdBox.y };
+            if (overlaps(birdBox, botR))
+                return { hit: true, vy: -bumpUp, y: birdBox.y };
+        }
+        return { hit: false, vy: birdBox.y, y: birdBox.y };
+    };
+    // keeps tracking of number of pipes passed (score)
+    const scorePasses = (
+        pipes: ReadonlyArray<Pipe>,
+        birdRight: number,
+        scoredIds: ReadonlyArray<number>,
+    ) => {
+        const newly = pipes
+            .filter(
+                p =>
+                    p.x + Constants.PIPE_WIDTH < birdRight &&
+                    !scoredIds.includes(p.id),
+            )
+            .map(p => p.id);
+        return { newly, scoreDelta: newly.length };
+    };
+
     // physics reducer
     const stepReducer =
         (dt: number, r: number) =>
@@ -476,19 +519,15 @@ export const state$ = (csvContents: string): Observable<State> => {
                 return { ...s, birdVy, birdY, flapCooldown: 0 };
             }
 
-            // before first click do nothing
+            // pause until first click
             if (!s.started) return s;
 
-            const TOP = 0;
-            const GROUND = Viewport.CANVAS_HEIGHT - Birb.HEIGHT - 65;
-            const PIPE_SPEED = 250;
-            const birdX = Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2;
-
+            // timers/cooldowns
             const elapsed = s.elapsed + dt;
             const hurtCooldown = Math.max(0, s.hurtCooldown - dt);
             const flapCooldown = Math.max(0, s.flapCooldown - dt);
 
-            // spawn and move pipes
+            // spawn & move pipes
             const [due, future] = partition(
                 s.remainingDefs,
                 d => d.time <= elapsed,
@@ -499,41 +538,26 @@ export const state$ = (csvContents: string): Observable<State> => {
                 gapY: d.gapYpx,
                 gapH: d.gapHpx,
             }));
-
             const pipes = s.pipes
                 .concat(spawned)
-                .map(p => ({ ...p, x: p.x - PIPE_SPEED * dt }))
+                .map(p => ({ ...p, x: p.x - Constants.PIPE_SPEED * dt }))
                 .filter(p => p.x + Constants.PIPE_WIDTH >= 0);
 
-            // bird physics (clamp only while alive)
-            let birdVy = s.birdVy + Constants.GRAVITY * dt;
-            let birdY = s.birdY + birdVy * dt;
-            if (birdY >= GROUND) {
-                birdY = GROUND;
-                birdVy = 0;
-            }
-            if (birdY <= TOP) {
-                birdY = TOP;
-                birdVy = 0;
-            }
+            // integrate then clamp while alive
+            const vy0 = s.birdVy + Constants.GRAVITY * dt;
+            const y0 = s.birdY + vy0 * dt;
+            const yClamped = y0 >= GROUND ? GROUND : y0 <= TOP ? TOP : y0;
+            const vyClamped = y0 <= TOP || y0 >= GROUND ? 0 : vy0;
 
-            // collisions
+            // edge bumps
             const bumpDown = 150 + r * 200;
             const bumpUp = 250 + r * 170;
+            const hitTop = yClamped <= TOP;
+            const hitGround = yClamped >= GROUND;
+            const birdVy1 = hitTop ? bumpDown : hitGround ? -bumpUp : vyClamped;
+            const birdY1 = hitGround ? GROUND : yClamped;
 
-            let lives = s.lives;
-            let hit = false;
-
-            if (birdY <= TOP) {
-                hit = true;
-                birdVy = bumpDown;
-            }
-            if (birdY >= GROUND) {
-                hit = true;
-                birdVy = -bumpUp;
-                birdY = GROUND;
-            }
-
+            // pipe collision
             const overlaps = (
                 a: { x: number; y: number; w: number; h: number },
                 b: { x: number; y: number; w: number; h: number },
@@ -543,43 +567,60 @@ export const state$ = (csvContents: string): Observable<State> => {
                 a.y < b.y + b.h &&
                 a.y + a.h > b.y;
 
+            type HitDir = "none" | "top" | "bottom";
             const birdBox = {
                 x: birdX,
-                y: birdY,
+                y: birdY1,
                 w: Birb.WIDTH,
                 h: Birb.HEIGHT,
             };
-            for (const p of pipes) {
-                const half = p.gapH / 2;
-                const topH = Math.max(0, p.gapY - half);
-                const botY = Math.min(Viewport.CANVAS_HEIGHT, p.gapY + half);
-                const topR = { x: p.x, y: 0, w: Constants.PIPE_WIDTH, h: topH };
-                const botR = {
-                    x: p.x,
-                    y: botY,
-                    w: Constants.PIPE_WIDTH,
-                    h: Viewport.CANVAS_HEIGHT - botY,
-                };
-                if (overlaps(birdBox, topR)) {
-                    hit = true;
-                    birdVy = bumpDown;
-                    break;
+            const pipeHit: HitDir = (() => {
+                for (const p of pipes) {
+                    const half = p.gapH / 2;
+                    const topH = Math.max(0, p.gapY - half);
+                    const botY = Math.min(
+                        Viewport.CANVAS_HEIGHT,
+                        p.gapY + half,
+                    );
+                    const topR = {
+                        x: p.x,
+                        y: 0,
+                        w: Constants.PIPE_WIDTH,
+                        h: topH,
+                    };
+                    const botR = {
+                        x: p.x,
+                        y: botY,
+                        w: Constants.PIPE_WIDTH,
+                        h: Viewport.CANVAS_HEIGHT - botY,
+                    };
+                    if (overlaps(birdBox, topR)) return "top";
+                    if (overlaps(birdBox, botR)) return "bottom";
                 }
-                if (overlaps(birdBox, botR)) {
-                    hit = true;
-                    birdVy = -bumpUp;
-                    break;
-                }
-            }
+                return "none";
+            })();
 
-            if (hit && hurtCooldown <= 0) {
-                lives = Math.max(0, lives - 1);
-            }
+            // apply pipe bump (if any)
+            const birdVy2 =
+                pipeHit === "top"
+                    ? bumpDown
+                    : pipeHit === "bottom"
+                      ? -bumpUp
+                      : birdVy1;
+            const birdY2 = birdY1;
 
+            // was there any hit this frame?
+            const hitThisFrame = hitTop || hitGround || pipeHit !== "none";
+
+            // lives & end condition
+            const lives =
+                hitThisFrame && hurtCooldown <= 0
+                    ? Math.max(0, s.lives - 1)
+                    : s.lives;
             const levelComplete = future.length === 0 && pipes.length === 0;
             const gameEnd = lives <= 0 || levelComplete;
 
-            // scoring
+            // scoring (passed pipes)
             const birdRight = birdX + Birb.WIDTH;
             const newlyPassed = pipes
                 .filter(
@@ -588,25 +629,28 @@ export const state$ = (csvContents: string): Observable<State> => {
                         !s.scoredIds.includes(p.id),
                 )
                 .map(p => p.id);
-            const score = s.score + newlyPassed.length;
             const scoredIds = newlyPassed.length
                 ? s.scoredIds.concat(newlyPassed)
                 : s.scoredIds;
+            const score = s.score + newlyPassed.length;
 
+            // next state
             return {
                 ...s,
                 elapsed,
                 flapCooldown,
                 remainingDefs: future,
                 pipes,
-                birdY,
-                birdVy,
+                birdY: birdY2,
+                birdVy: birdVy2,
                 lives,
                 score,
                 scoredIds,
                 nextPipeId: s.nextPipeId + due.length,
                 hurtCooldown:
-                    hit && hurtCooldown <= 0 && !gameEnd ? 0.6 : hurtCooldown,
+                    hitThisFrame && hurtCooldown <= 0 && !gameEnd
+                        ? 0.6
+                        : hurtCooldown,
                 gameEnd,
             };
         };

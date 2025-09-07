@@ -1,4 +1,7 @@
+
 # Assignment 1
+
+LINK TO GIT HUB: https://github.com/Jaym619/a1.git
 
 ## Usage
 
