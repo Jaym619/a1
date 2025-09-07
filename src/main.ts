@@ -33,12 +33,10 @@ import {
     shareReplay,
     defer,
     EMPTY,
-    zipWith,
     finalize,
     BehaviorSubject,
     ignoreElements,
-    animationFrameScheduler,
-    observeOn,
+    toArray,
 } from "rxjs";
 import { fromFetch } from "rxjs/fetch";
 
@@ -287,6 +285,35 @@ const render = (): ((s: State) => void) => {
             });
         }
 
+        const ghostImgs: SVGImageElement[] = [];
+        {
+            // ensure enough image nodes exist
+            while (ghostImgs.length < s.ghostYs.length) {
+                const gi = createSvgElement(svg.namespaceURI, "image", {
+                    href: "assets/birb.png",
+                    x: String(Viewport.CANVAS_WIDTH * 0.3 - Birb.WIDTH / 2),
+                    y: "0",
+                    width: String(Birb.WIDTH),
+                    height: String(Birb.HEIGHT),
+                    opacity: "0.32",
+                    "pointer-events": "none",
+                }) as SVGImageElement;
+                ghostsG.appendChild(gi);
+                ghostImgs.push(gi);
+            }
+
+            // show or update only the ghosts we need this frame
+            for (let i = 0; i < ghostImgs.length; i++) {
+                const img = ghostImgs[i];
+                if (i < s.ghostYs.length) {
+                    img.setAttribute("visibility", "visible");
+                    img.setAttribute("y", String(s.ghostYs[i]));
+                } else {
+                    img.setAttribute("visibility", "hidden");
+                }
+            }
+        }
+
         // updates lives and score
         if (livesText) livesText.textContent = `Lives: ${s.lives}`;
         if (scoreText) scoreText.textContent = `Score: ${s.score}`;
@@ -345,8 +372,8 @@ const render = (): ((s: State) => void) => {
 
 export const state$ = (csvContents: string): Observable<State> => {
     // previous run’s recording
-    const ghostPrevAll$ = new BehaviorSubject<
-        ReadonlyArray<Observable<number>>
+    const ghostFramesAll$ = new BehaviorSubject<
+        ReadonlyArray<ReadonlyArray<number>>
     >([]);
 
     // constants
@@ -631,30 +658,26 @@ export const state$ = (csvContents: string): Observable<State> => {
         // after first click start ghosts
         const ghostPlaybackReducerForRun$ = startClick$.pipe(
             switchMap(() =>
-                ghostPrevAll$.pipe(
+                ghostFramesAll$.pipe(
+                    // snapshot the catalog at the moment this run begins
                     take(1),
-                    switchMap(recs => {
-                        if (recs.length === 0) return EMPTY;
+                    switchMap(framesList => {
+                        if (framesList.length === 0) return EMPTY;
+                        const tick$ = dtForRun$.pipe(share());
+                        const idx$ = tick$.pipe(scan(i => i + 1, -1));
 
-                        // one paced stream per prior run
-                        const paced = recs.map(rec$ =>
-                            rec$.pipe(
-                                observeOn(animationFrameScheduler),
-                                zipWith(dtForRun$),
-                            ),
-                        );
-
-                        // map each ghost to a reducer that writes its y into ghostYs
-                        return merge(
-                            ...paced.map((y$, i) =>
-                                y$.pipe(
-                                    map(([y]) => (s: State): State => {
-                                        const ys = s.ghostYs.slice(0);
-                                        ys[i] = y;
-                                        return { ...s, ghostYs: ys };
-                                    }),
-                                ),
-                            ),
+                        // one reducer per frame set ghostYs from the snapshots
+                        return idx$.pipe(
+                            map(i => {
+                                const idx = Math.max(0, i);
+                                const ys = framesList.map(
+                                    fr => fr[Math.min(idx, fr.length - 1)],
+                                );
+                                return (s: State): State => ({
+                                    ...s,
+                                    ghostYs: ys,
+                                });
+                            }),
                         );
                     }),
                 ),
@@ -678,7 +701,7 @@ export const state$ = (csvContents: string): Observable<State> => {
 
         // detects when the game has ended
         const gameOver$ = runBaseRaw$.pipe(
-            filter(s => s.gameEnd), // lives <= 0 or level complete
+            filter(s => s.gameEnd),
             take(1),
         );
 
@@ -694,7 +717,14 @@ export const state$ = (csvContents: string): Observable<State> => {
         );
 
         // record this run
-        const thisRunRecording$ = runBase$.pipe(
+        const thisRunRecording$ = dtForRun$.pipe(
+            // ensure completion for finalize
+            takeUntil(endOnRestartAfterOver$),
+            // tick stream
+            withLatestFrom(runBase$),
+            map(([, s]) => s),
+            // ignore clicks before start
+            filter(s => s.started),
             map(s => s.birdY),
             shareReplay({ bufferSize: Infinity, refCount: false }),
         );
@@ -705,8 +735,11 @@ export const state$ = (csvContents: string): Observable<State> => {
         // frozen recording when the run completes
         return merge(keepRecorderHot$, runBase$).pipe(
             finalize(() => {
-                const prev = ghostPrevAll$.getValue(); // OK in RxJS; read-only snapshot
-                ghostPrevAll$.next(prev.concat(thisRunRecording$));
+                thisRunRecording$.pipe(toArray(), take(1)).subscribe(frames => {
+                    const prev = ghostFramesAll$.getValue();
+                    // append immutable snapshot
+                    ghostFramesAll$.next(prev.concat([frames]));
+                });
             }),
         );
     });
